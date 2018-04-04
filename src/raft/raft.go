@@ -23,7 +23,6 @@ import (
 "log"
 "math/rand"
 "time"
-	"fmt"
 )
 
 // import "bytes"
@@ -31,7 +30,7 @@ import (
 
 
 const (
-	HEARTBEAT_TICKER_DURATION time.Duration = time.Millisecond * 10
+	HEARTBEAT_TICKER_DURATION time.Duration = time.Millisecond * 5
 )
 
 //
@@ -151,12 +150,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			// heartbeat, reset timer
 			reply.Agree = true
 			rf.electionTimer.Reset(rf.electionTimeout)
+			//log.Println("rf ", args.Me, " -> rf ", rf.me)
 		}
 
 	} else if args.Term > rf.currentTerm {
 		// vote request
-		fmt.Println("server ", rf.me, " receive vote request from ",
-			args.Me, " term ", args.Term)
 		_, voted := rf.votedTerms[args.Term]
 
 		if voted {
@@ -173,7 +171,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.votedTerms[args.Term] = args.Me
 			rf.currentTerm = args.Term
 			rf.electionTimer.Reset(rf.electionTimeout)
-			fmt.Println("server ", rf.me, " reset timer")
+			log.Println("Raft ", rf.me, " vote Raft ", args.Me, " as leader in term ",
+				args.Term)
 		}
 
 	} else {
@@ -333,17 +332,14 @@ OuterLoop:
 	for ; count > 0; count-- {
 		select {
 		case agree := <- ch:
-			fmt.Println("agree + 1 ", agree)
-			agreeCount++
-			continue
+			if agree {
+				agreeCount++
+			}
 		case <- timeout.C:
-			fmt.Println("wait election timeout!")
 			break OuterLoop
 		}
 	}
 
-
-	fmt.Println("server ", rf.me, " get ", agreeCount, " votes")
 	if agreeCount > (len(rf.peers) / 2) {
 		//we win the election
 		rf.hasLeader = true
@@ -378,14 +374,17 @@ func (rf *Raft) sendHeartbeat() {
 			term := rf.currentTerm
 			rf.mu.Unlock()
 			for server := range rf.peers {
+				log.Println("Rf ", rf.me, " -> Rf ", server)
 				go func() {
 					var req RequestVoteArgs
-					var	rsp RequestVoteReply
-
 					req.Me = rf.me
 					req.Term = term
 
-					rf.sendRequestVote(server, &req, &rsp)
+					err, _ := rf.syncSendRequest(server, &req, time.Millisecond * 10)
+					if err != nil {
+						log.Println("Raft ", rf.me, "send heartbeat to ",
+							server, " failed: ", err)
+					}
 				} ()
 			}
 
@@ -400,4 +399,42 @@ func (rf *Raft) sendHeartbeat() {
 
 func (rf *Raft) stopHeartbeat() {
 	rf.stopHeartbeatCh <- true
+}
+
+
+func (rf *Raft) syncSendRequest(
+	server int,
+	req *RequestVoteArgs,
+	timeout time.Duration) (error, *RequestVoteReply) {
+	var rsp RequestVoteReply
+	var err error
+
+	t := time.NewTimer(timeout)
+	ch := make(chan bool)
+	go func() {
+		if rf.sendRequestVote(server, req, &rsp) {
+			ch <- true
+		} else {
+			ch <- false
+		}
+	} ()
+
+	select {
+	case ok := <- ch:
+		if !ok {
+			err = &RfError{"request failed"}
+		}
+
+	case <- t.C:
+		err = &RfError{"request timeout"}
+	}
+	return  err, &rsp
+}
+
+type RfError struct {
+	err string
+}
+
+func (rf *RfError) Error() string {
+	return rf.err
 }
