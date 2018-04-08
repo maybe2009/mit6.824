@@ -19,15 +19,14 @@ package raft
 
 import "sync"
 import (
-"labrpc"
-"log"
-"math/rand"
-"time"
+	"labrpc"
+	"log"
+	"math/rand"
+	"time"
 )
 
 // import "bytes"
 // import "encoding/gob"
-
 
 const (
 	HEARTBEAT_TICKER_DURATION time.Duration = time.Millisecond * 5
@@ -57,11 +56,11 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	hasLeader      bool
-	leader         int
-	currentTerm    int
-	votedTerms     map[int]int
-	electionTimer  *time.Timer
+	hasLeader       bool
+	leader          int
+	currentTerm     int
+	votedTerms      map[int]int
+	electionTimer   *time.Timer
 	electionTimeout time.Duration
 
 	stopHeartbeatCh chan bool
@@ -77,9 +76,9 @@ func (rf *Raft) GetState() (int, bool) {
 
 	term = rf.currentTerm
 	if rf.leader == rf.me {
-		isleader = true;
+		isleader = true
 	} else {
-		isleader = false;
+		isleader = false
 	}
 
 	return term, isleader
@@ -140,6 +139,7 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	//log.Println("Raft ", rf.me, "term ", rf.currentTerm, " receive vote request from Raft ", args.Me, " term ", args.Term)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -210,6 +210,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	//log.Println("Rf ", rf.me, " term ", rf.currentTerm, " call Rf ", server, " term ", args.Term)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
@@ -271,15 +272,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// init heartbeat channel
 	rf.stopHeartbeatCh = make(chan bool)
 
-	// pick an random election timeout
-	rand.Seed(int64(me))
-	rf.electionTimeout = time.Duration(rand.Uint32()%100+150) * time.Millisecond
-	rf.electionTimer = time.NewTimer(rf.electionTimeout)
-
-	log.Println("server ", me, " timeout ", rf.electionTimeout.Seconds())
-
 	// start election clock
-	go rf.onElectionTimeout()
+	go rf.startElectionTimer()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -287,12 +281,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
-func (rf *Raft) onElectionTimeout() {
-	t := <- rf.electionTimer.C
-	log.Println("server ", rf.me, " election timeout: ", t)
+func (rf *Raft) startElectionTimer() {
+	// pick an random election timeout
+	rand.Seed(int64(rf.me))
+	rf.electionTimeout = time.Duration(rand.Uint32()%100+150) * time.Millisecond
+	rf.electionTimer = time.NewTimer(rf.electionTimeout)
+	log.Println("server ", rf.me, " timeout ", rf.electionTimeout.Seconds())
 
-	rf.hasLeader = false
-	rf.triggerElection()
+	for _ = range rf.electionTimer.C {
+		rf.hasLeader = false
+		log.Println("server ", rf.me, " launch new electrion")
+		rf.triggerElection()
+	}
+
 }
 
 func (rf *Raft) triggerElection() {
@@ -301,41 +302,40 @@ func (rf *Raft) triggerElection() {
 	ch := make(chan bool)
 	timeout := time.NewTimer(time.Millisecond * 50)
 
-	for server := range rf.peers {
+	// send vote request to all raft nodes
+	for server, _ := range rf.peers {
 		if server == rf.me {
 			agreeCount++
 			continue
 		}
 
-		//fmt.Println("send to ", server)
 		go func(me int, server int, term int) {
-			var	req RequestVoteArgs
-			var	rsp RequestVoteReply
+			var req RequestVoteArgs
+			var rsp RequestVoteReply
 
 			req.Me = me
 			req.Term = term
 
 			rf.sendRequestVote(server, &req, &rsp)
 
-
 			if rsp.Agree {
 				ch <- true
 			} else {
 				ch <- false
 			}
-		}(rf.me, server, rf.currentTerm + 1)
+		}(rf.me, server, rf.currentTerm+1)
 	}
 
+	// wait for vote result
 	count := len(rf.peers)
-
 OuterLoop:
 	for ; count > 0; count-- {
 		select {
-		case agree := <- ch:
+		case agree := <-ch:
 			if agree {
 				agreeCount++
 			}
-		case <- timeout.C:
+		case <-timeout.C:
 			break OuterLoop
 		}
 	}
@@ -349,6 +349,9 @@ OuterLoop:
 
 		//turn into leader
 		rf.enthrone()
+
+	} else {
+		log.Println("server ", rf.me, " failed to win the election in term ")
 	}
 
 	rf.electionTimer.Reset(rf.electionTimeout)
@@ -356,6 +359,7 @@ OuterLoop:
 
 func (rf *Raft) enthrone() {
 	log.Println("Raft ", rf.me, " enthrone")
+
 	go rf.sendHeartbeat()
 }
 
@@ -367,28 +371,31 @@ func (rf *Raft) dethrone() {
 func (rf *Raft) sendHeartbeat() {
 	ticker := time.NewTicker(HEARTBEAT_TICKER_DURATION)
 
-	for  {
+	for {
 		select {
-		case <- ticker.C:
+		case <-ticker.C:
 			rf.mu.Lock()
 			term := rf.currentTerm
 			rf.mu.Unlock()
-			for server := range rf.peers {
-				log.Println("Rf ", rf.me, " -> Rf ", server)
-				go func() {
+
+			//log.Println("send heartbeat to ", len(rf.peers), " peers: ", rf.peers)
+			for server, _ := range rf.peers {
+				//log.Println("Rf ", rf.me, " -> Rf ", server)
+				go func(server int) {
 					var req RequestVoteArgs
 					req.Me = rf.me
 					req.Term = term
 
-					err, _ := rf.syncSendRequest(server, &req, time.Millisecond * 10)
+					//log.Println("send to ", server)
+					err, _ := rf.syncSendRequest(server, &req, time.Millisecond*10)
 					if err != nil {
-						log.Println("Raft ", rf.me, "send heartbeat to ",
-							server, " failed: ", err)
+						//log.Println("Raft ", rf.me, "send heartbeat to ",
+						//	server, " failed: ", err)
 					}
-				} ()
+				}(server)
 			}
 
-		case stop := <- rf.stopHeartbeatCh:
+		case stop := <-rf.stopHeartbeatCh:
 			if stop {
 				log.Println("raft ", rf.me, " stop sending heartbeat")
 				return
@@ -400,7 +407,6 @@ func (rf *Raft) sendHeartbeat() {
 func (rf *Raft) stopHeartbeat() {
 	rf.stopHeartbeatCh <- true
 }
-
 
 func (rf *Raft) syncSendRequest(
 	server int,
@@ -417,18 +423,18 @@ func (rf *Raft) syncSendRequest(
 		} else {
 			ch <- false
 		}
-	} ()
+	}()
 
 	select {
-	case ok := <- ch:
+	case ok := <-ch:
 		if !ok {
 			err = &RfError{"request failed"}
 		}
 
-	case <- t.C:
+	case <-t.C:
 		err = &RfError{"request timeout"}
 	}
-	return  err, &rsp
+	return err, &rsp
 }
 
 type RfError struct {
