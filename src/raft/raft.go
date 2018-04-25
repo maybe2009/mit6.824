@@ -161,6 +161,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.Agree = false
 
 		} else {
+			rf.stopElectionTimer()
+
 			// new term start
 			if rf.leader == rf.me {
 				rf.dethrone()
@@ -265,7 +267,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-
+	rf.leader = -1
+	rf.hasLeader = false
 	// Your initialization code here (2A, 2B, 2C).
 	rf.votedTerms = map[int]int{}
 
@@ -290,14 +293,16 @@ func (rf *Raft) startElectionTimer() {
 
 	for _ = range rf.electionTimer.C {
 		rf.hasLeader = false
-		log.Println("server ", rf.me, " launch new electrion")
 		rf.triggerElection()
 	}
 
 }
 
-func (rf *Raft) triggerElection() {
+func (rf *Raft) stopElectionTimer() {
+	rf.electionTimer.Stop()
+}
 
+func (rf *Raft) acquireVote() int {
 	agreeCount := 0
 	ch := make(chan bool)
 	timeout := time.NewTimer(time.Millisecond * 50)
@@ -316,6 +321,7 @@ func (rf *Raft) triggerElection() {
 			req.Me = me
 			req.Term = term
 
+			//log.Println("Raft ", me, " send vote request to ", server, " term ", term)
 			rf.sendRequestVote(server, &req, &rsp)
 
 			if rsp.Agree {
@@ -323,7 +329,7 @@ func (rf *Raft) triggerElection() {
 			} else {
 				ch <- false
 			}
-		}(rf.me, server, rf.currentTerm+1)
+		}(rf.me, server, rf.currentTerm)
 	}
 
 	// wait for vote result
@@ -340,25 +346,34 @@ OuterLoop:
 		}
 	}
 
+	return agreeCount
+}
+
+func (rf *Raft) triggerElection() {
+	rf.currentTerm = rf.currentTerm + 1
+
+	log.Println("server ", rf.me, " trigger election in term ", rf.currentTerm)
+
+	agreeCount := rf.acquireVote()
 	if agreeCount > (len(rf.peers) / 2) {
 		//we win the election
-		rf.hasLeader = true
-		rf.leader = rf.me
-		rf.currentTerm = rf.currentTerm + 1
-		log.Println("server ", rf.me, " win the election in term ", rf.currentTerm)
-
 		//turn into leader
 		rf.enthrone()
 
 	} else {
-		log.Println("server ", rf.me, " failed to win the election in term ")
+		log.Println("server ", rf.me, " failed to win the election in term ",
+			rf.currentTerm)
+		rf.currentTerm = rf.currentTerm - 1
 	}
 
 	rf.electionTimer.Reset(rf.electionTimeout)
 }
 
 func (rf *Raft) enthrone() {
-	log.Println("Raft ", rf.me, " enthrone")
+	log.Println("server ", rf.me, " win the election in term ", rf.currentTerm)
+
+	rf.hasLeader = true
+	rf.leader = rf.me
 
 	go rf.sendHeartbeat()
 }
