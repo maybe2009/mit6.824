@@ -29,7 +29,8 @@ import (
 // import "encoding/gob"
 
 const (
-	HEARTBEAT_TICKER_DURATION time.Duration = time.Millisecond * 5
+	HEARTBEAT_TICKER_DURATION     time.Duration = time.Millisecond * 5
+	BROADCAST_LOG_TICKER_DURATION time.Duration = time.Millisecond * 10
 )
 
 //
@@ -64,6 +65,15 @@ type Raft struct {
 	electionTimeout time.Duration
 
 	stopHeartbeatCh chan bool
+
+	// 2B
+	log                []logItem
+	nextIndex          map[int]int
+	matchIndex         map[int]int
+	stopBroadcastLogCh chan bool
+	logSuccessCount    map[int]int
+	commitIndex        int
+	applyCh            chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -134,6 +144,28 @@ type RequestVoteReply struct {
 	Agree bool
 }
 
+type logItem struct {
+	Term    int
+	Command interface{}
+}
+
+//
+//
+//
+type AppendEntriesArgs struct {
+	Me          int
+	PrevIndex   int
+	PrevTerm    int
+	Term        int
+	Logs        []logItem
+	CommitIndex int
+}
+
+type AppendEntriesReply struct {
+	Ok   bool
+	Term int
+}
+
 //
 // example RequestVote RPC handler.
 //
@@ -182,6 +214,59 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 }
 
+// AppendEntries RPC handler.
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	//log.Println("Server ", rf.me, " receive AppendEntries from ", args.Me, " msg: ", args)
+	reply.Term = rf.currentTerm
+
+	// Not a legal leader
+	if args.Term < rf.currentTerm || rf.leader != args.Me {
+		reply.Ok = false
+		return
+	}
+
+	// Current log is shorter
+	if len(rf.log)-1 < args.PrevIndex {
+		reply.Ok = false
+		return
+	}
+
+	// Previous log item not match
+	if rf.log[args.PrevIndex].Term != args.PrevTerm {
+		reply.Ok = false
+		return
+	}
+
+	// Ok, log match
+	reply.Ok = true
+
+	// If args.Logs is not empty, fill them in
+	nextIndex := args.PrevIndex + 1
+	if len(args.Logs) > 0 {
+		// Erase any log after PrevIndex
+		rf.log = rf.log[:nextIndex]
+		rf.log = append(rf.log, args.Logs...)
+		//log.Println("server ", rf.me, " append logs at ", nextIndex, " logs ", args.Logs)
+	}
+
+	latestIndex := len(rf.log) - 1
+	if args.CommitIndex < latestIndex {
+		rf.commitIndex = args.CommitIndex
+	} else {
+		rf.commitIndex = latestIndex
+	}
+	log.Println("server ", rf.me, " latestIndex ", latestIndex, " commit index ", args.CommitIndex)
+	rf.commitLog()
+}
+
+func (rf *Raft) commitLog() {
+	cmd := rf.log[rf.commitIndex].Command
+	msg := ApplyMsg{Index: rf.commitIndex, Command: cmd}
+	rf.applyCh <- msg
+
+	log.Println("Server ", rf.me, " commit index ", rf.commitIndex)
+}
+
 //
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
@@ -217,6 +302,11 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -236,6 +326,20 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+
+	if rf.leader == rf.me {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+
+		// Append log to master
+		log.Println("Raft ", rf.me, " add command ", command)
+		newLog := logItem{rf.currentTerm, command.(int)}
+		rf.log = append(rf.log, newLog)
+		index = len(rf.log) - 1
+		term = rf.currentTerm
+	} else {
+		isLeader = false
+	}
 
 	return index, term, isLeader
 }
@@ -269,17 +373,25 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 	rf.leader = -1
 	rf.hasLeader = false
+
 	// Your initialization code here (2A, 2B, 2C).
+
+	rf.log = []logItem{logItem{-1, 0}} // fill in an empty log
+
 	rf.votedTerms = map[int]int{}
 
 	// init heartbeat channel
 	rf.stopHeartbeatCh = make(chan bool)
+
+	rf.stopBroadcastLogCh = make(chan bool)
 
 	// start election clock
 	go rf.startElectionTimer()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+	rf.applyCh = applyCh
 
 	return rf
 }
@@ -376,11 +488,13 @@ func (rf *Raft) enthrone() {
 	rf.leader = rf.me
 
 	go rf.sendHeartbeat()
+	go rf.broadcastLogs()
 }
 
 func (rf *Raft) dethrone() {
 	defer log.Println("Raft ", rf.me, " dethrone")
 	rf.stopHeartbeat()
+	rf.stopBroadcastLogs()
 }
 
 func (rf *Raft) sendHeartbeat() {
@@ -450,6 +564,187 @@ func (rf *Raft) syncSendRequest(
 		err = &RfError{"request timeout"}
 	}
 	return err, &rsp
+}
+
+const (
+	Success = iota
+	Failed
+	LogInconsistent
+	OldTerm
+)
+
+type ReplicateState struct {
+	Ok          bool
+	Result      int
+	Term        int
+	Server      int
+	LatestIndex int
+}
+
+// Broadcast logs o all follower at an fixed interval
+func (rf *Raft) broadcastLogs() {
+	rf.nextIndex = make(map[int]int)
+	rf.matchIndex = make(map[int]int)
+	rf.logSuccessCount = make(map[int]int)
+
+	nextIndex := len(rf.log)
+	for server := range rf.peers {
+		rf.nextIndex[server] = nextIndex
+	}
+
+	successCh := make(chan ReplicateState)
+
+	// Start a goroutine to receive result
+	go rf.receiveBroadcastResult(successCh)
+
+	// Start a goroutine to broadcast logs
+	go rf.broadcastOnTicker(successCh)
+}
+
+// Replicate log to follower
+func (rf *Raft) replicateLog(server , latestIndex, commitIndex int, successCh chan<- ReplicateState) {
+	nextIndex := rf.nextIndex[server]
+	// New log to replicate
+	if latestIndex >= nextIndex {
+		//log.Println("replicate to server ", server, " nextIndex ", nextIndex)
+
+		state := ReplicateState{Ok: false, Result: Failed, Server: server}
+
+		var args AppendEntriesArgs
+		var reply AppendEntriesReply
+		args.Me = rf.me
+		args.Term = rf.currentTerm
+		args.PrevIndex = nextIndex - 1
+		args.PrevTerm = rf.log[args.PrevIndex].Term
+		args.Logs = rf.log[nextIndex : latestIndex+1]
+		args.CommitIndex = commitIndex
+
+		ok := rf.sendAppendEntries(server, &args, &reply)
+		if !ok {
+			state.Ok = false
+
+		} else if !reply.Ok && rf.currentTerm >= reply.Term {
+			state.Ok = true
+			state.Result = LogInconsistent
+			state.Term = reply.Term
+
+		} else if !reply.Ok && rf.currentTerm < reply.Term {
+			// Follower has high term, do nothing and just wait new leader's heartbeat
+			state.Ok = true
+			state.Result = OldTerm
+			state.Term = reply.Term
+
+		} else {
+			state.Ok = true
+			state.Result = Success
+			state.Term = reply.Term
+			state.LatestIndex = latestIndex
+		}
+
+		successCh <- state
+	}
+}
+
+func (rf *Raft) sendCommitIndex(index int) {
+
+}
+
+func (rf *Raft) broadcastOnTicker(successCh chan<- ReplicateState) {
+	ticker := time.NewTicker(BROADCAST_LOG_TICKER_DURATION)
+	for {
+		select {
+		case <-ticker.C:
+			latestIndex := len(rf.log) - 1
+			commitIndex := rf.commitIndex
+			//log.Println("broadcasting... latest logIndex ", latestIndex, " commitIndex ", commitIndex)
+			for server := range rf.peers {
+				if server != rf.me {
+					// Don't replicate to itself
+					go rf.replicateLog(server, latestIndex, commitIndex, successCh)
+				}
+			}
+
+		case <-rf.stopBroadcastLogCh:
+			log.Println("Raft ", rf.me, " stop broadcast logs")
+		}
+	}
+}
+
+func (rf *Raft) receiveBroadcastResult(ch <-chan ReplicateState) {
+	for {
+		select {
+		case state := <-ch:
+			if !state.Ok {
+				log.Println("Rf ", rf.me, " replicate log to server ", state.Server, " failed")
+
+			} else if state.Result == Success {
+				//log.Println("Rf ", rf.me, " replicate log to server ", state.Server, " success, next index ",
+					//state.LatestIndex)
+
+				rf.nextIndex[state.Server] = state.LatestIndex + 1
+				rf.matchIndex[state.LatestIndex] = state.LatestIndex
+
+				rf.logSuccessCount[state.LatestIndex]++
+				if rf.logSuccessCount[state.LatestIndex] > len(rf.peers)/2 {
+					//log.Println(rf.logSuccessCount[state.LatestIndex], " server have received log index ", state.LatestIndex, " commitIndex ", rf.commitIndex)
+
+					// Master commit log
+					if state.LatestIndex > rf.commitIndex {
+						rf.commitIndex = state.LatestIndex
+
+						rf.commitLog()
+					}
+				}
+
+			} else if state.Result == LogInconsistent {
+				rf.nextIndex[state.Server] = rf.repositionNextIndex(state.Server)
+				log.Println("Rf ", rf.me, " has inconsistent log with ", state.Server, " adjust next index to",
+					rf.nextIndex[state.Server])
+
+			} else if state.Result == OldTerm {
+				log.Println("Follower ", state.Server, " has newer term ", state.Term)
+			}
+
+		case <-rf.stopBroadcastLogCh:
+			log.Println("Rf ", rf.me, " stop receiving broadcast result")
+			break
+		}
+	}
+}
+
+// Stop broadcasting logs
+func (rf *Raft) stopBroadcastLogs() {
+	// Stop sending & receiving
+	rf.stopBroadcastLogCh <- true
+	rf.stopBroadcastLogCh <- true
+}
+
+// Find the latest log which leader and follower agree
+func (rf *Raft) repositionNextIndex(server int) int {
+	prevIndex := rf.nextIndex[server] - 1
+
+	for {
+		var args AppendEntriesArgs
+		var reply AppendEntriesReply
+
+		args.Me = rf.me
+		args.Term = rf.currentTerm
+		args.PrevIndex = prevIndex
+		args.PrevTerm = rf.log[args.PrevIndex].Term
+		ok := rf.sendAppendEntries(server, &args, &reply)
+		if !ok && reply.Term > rf.currentTerm {
+			// Follower has high term, do nothing and just wait new leader's heartbeat
+			return -1
+
+		} else if !ok && reply.Term <= rf.currentTerm {
+			// Normal follower, decrement index to find the match index
+			prevIndex--
+
+		} else {
+			// Leader and follower agree on log index prevIndex, adjust nextIndex
+			return prevIndex + 1
+		}
+	}
 }
 
 type RfError struct {
