@@ -71,9 +71,10 @@ type Raft struct {
 	nextIndex          map[int]int
 	matchIndex         map[int]int
 	stopBroadcastLogCh chan bool
-	logSuccessCount    map[int]int
+	logSuccessCount    map[int]map[int]bool
 	commitIndex        int
 	applyCh            chan ApplyMsg
+	commitIndexs		map[int]int
 }
 
 // return currentTerm and whether this server
@@ -164,6 +165,7 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Ok   bool
 	Term int
+	CommitIndex int
 }
 
 //
@@ -255,8 +257,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else {
 		rf.commitIndex = latestIndex
 	}
-	log.Println("server ", rf.me, " latestIndex ", latestIndex, " commit index ", args.CommitIndex)
 	rf.commitLog()
+
+	log.Println("server ", rf.me, " latestIndex ", latestIndex, " commit index ", args.CommitIndex)
 }
 
 func (rf *Raft) commitLog() {
@@ -585,7 +588,8 @@ type ReplicateState struct {
 func (rf *Raft) broadcastLogs() {
 	rf.nextIndex = make(map[int]int)
 	rf.matchIndex = make(map[int]int)
-	rf.logSuccessCount = make(map[int]int)
+	rf.logSuccessCount = make(map[int]map[int]bool)
+	rf.commitIndexs = make(map[int]int)
 
 	nextIndex := len(rf.log)
 	for server := range rf.peers {
@@ -601,25 +605,25 @@ func (rf *Raft) broadcastLogs() {
 	go rf.broadcastOnTicker(successCh)
 }
 
-// Replicate log to follower
-func (rf *Raft) replicateLog(server , latestIndex, commitIndex int, successCh chan<- ReplicateState) {
-	nextIndex := rf.nextIndex[server]
-	// New log to replicate
-	if latestIndex >= nextIndex {
+// Replicate log or send new commit to follower
+func (rf *Raft) replicateLog(server, followerNext, leaderLatest, leaderCommit int, successCh chan<- ReplicateState) {
 		//log.Println("replicate to server ", server, " nextIndex ", nextIndex)
-
-		state := ReplicateState{Ok: false, Result: Failed, Server: server}
-
 		var args AppendEntriesArgs
 		var reply AppendEntriesReply
 		args.Me = rf.me
 		args.Term = rf.currentTerm
-		args.PrevIndex = nextIndex - 1
+		args.PrevIndex = followerNext - 1
 		args.PrevTerm = rf.log[args.PrevIndex].Term
-		args.Logs = rf.log[nextIndex : latestIndex+1]
-		args.CommitIndex = commitIndex
+		args.CommitIndex = leaderCommit
+
+		// New log to replicated
+		if leaderLatest >= followerNext {
+			args.Logs = rf.log[followerNext : leaderLatest+1]
+		}
 
 		ok := rf.sendAppendEntries(server, &args, &reply)
+		state := ReplicateState{Ok: false, Result: Failed, Server: server}
+
 		if !ok {
 			state.Ok = false
 
@@ -638,11 +642,10 @@ func (rf *Raft) replicateLog(server , latestIndex, commitIndex int, successCh ch
 			state.Ok = true
 			state.Result = Success
 			state.Term = reply.Term
-			state.LatestIndex = latestIndex
+			state.LatestIndex = leaderLatest
 		}
 
 		successCh <- state
-	}
 }
 
 func (rf *Raft) sendCommitIndex(index int) {
@@ -654,13 +657,16 @@ func (rf *Raft) broadcastOnTicker(successCh chan<- ReplicateState) {
 	for {
 		select {
 		case <-ticker.C:
-			latestIndex := len(rf.log) - 1
-			commitIndex := rf.commitIndex
+			leaderLatest := len(rf.log) - 1
+			leaderCommit := rf.commitIndex
 			//log.Println("broadcasting... latest logIndex ", latestIndex, " commitIndex ", commitIndex)
+
 			for server := range rf.peers {
-				if server != rf.me {
-					// Don't replicate to itself
-					go rf.replicateLog(server, latestIndex, commitIndex, successCh)
+				followerNext := rf.nextIndex[server]
+				followerCommit := rf.commitIndexs[server]
+
+				if server != rf.me && (leaderLatest >= followerNext || leaderCommit > followerCommit) {
+					go rf.replicateLog(server, followerNext, leaderLatest, leaderCommit, successCh)
 				}
 			}
 
@@ -670,40 +676,49 @@ func (rf *Raft) broadcastOnTicker(successCh chan<- ReplicateState) {
 	}
 }
 
+func (rf *Raft) addReplicateCount(index , server int) {
+	_, ok := rf.logSuccessCount[index]
+	if !ok {
+		rf.logSuccessCount[index] = make(map[int]bool)
+	}
+	rf.logSuccessCount[index][server] = true
+}
+
+func (rf *Raft) updateFollowerStatistic(state *ReplicateState) {
+	if !state.Ok {
+		log.Println("Rf ", rf.me, " replicate log to server ", state.Server, " failed")
+
+	} else if state.Result == Success {
+		//log.Println("Rf ", rf.me, " replicate log to server ", state.Server, " success, next index ",
+		//state.LatestIndex)
+
+		rf.nextIndex[state.Server] = state.LatestIndex + 1
+		rf.matchIndex[state.LatestIndex] = state.LatestIndex
+		rf.addReplicateCount(state.LatestIndex, state.Server)
+
+		// Leader commit log
+		if state.LatestIndex > rf.commitIndex && len(rf.logSuccessCount[state.LatestIndex]) > len(rf.peers)/2 {
+			//log.Println(rf.logSuccessCount[state.LatestIndex], " server have received log index ", state.LatestIndex, " commitIndex ", rf.commitIndex)
+
+			rf.commitIndex = state.LatestIndex
+			rf.commitLog()
+		}
+
+	} else if state.Result == LogInconsistent {
+		rf.nextIndex[state.Server] = rf.repositionNextIndex(state.Server)
+		log.Println("Rf ", rf.me, " has inconsistent log with ", state.Server, " adjust next index to",
+			rf.nextIndex[state.Server])
+
+	} else if state.Result == OldTerm {
+		log.Println("Follower ", state.Server, " has newer term ", state.Term)
+	}
+}
+
 func (rf *Raft) receiveBroadcastResult(ch <-chan ReplicateState) {
 	for {
 		select {
 		case state := <-ch:
-			if !state.Ok {
-				log.Println("Rf ", rf.me, " replicate log to server ", state.Server, " failed")
-
-			} else if state.Result == Success {
-				//log.Println("Rf ", rf.me, " replicate log to server ", state.Server, " success, next index ",
-					//state.LatestIndex)
-
-				rf.nextIndex[state.Server] = state.LatestIndex + 1
-				rf.matchIndex[state.LatestIndex] = state.LatestIndex
-
-				rf.logSuccessCount[state.LatestIndex]++
-				if rf.logSuccessCount[state.LatestIndex] > len(rf.peers)/2 {
-					//log.Println(rf.logSuccessCount[state.LatestIndex], " server have received log index ", state.LatestIndex, " commitIndex ", rf.commitIndex)
-
-					// Master commit log
-					if state.LatestIndex > rf.commitIndex {
-						rf.commitIndex = state.LatestIndex
-
-						rf.commitLog()
-					}
-				}
-
-			} else if state.Result == LogInconsistent {
-				rf.nextIndex[state.Server] = rf.repositionNextIndex(state.Server)
-				log.Println("Rf ", rf.me, " has inconsistent log with ", state.Server, " adjust next index to",
-					rf.nextIndex[state.Server])
-
-			} else if state.Result == OldTerm {
-				log.Println("Follower ", state.Server, " has newer term ", state.Term)
-			}
+			rf.updateFollowerStatistic(&state)
 
 		case <-rf.stopBroadcastLogCh:
 			log.Println("Rf ", rf.me, " stop receiving broadcast result")
