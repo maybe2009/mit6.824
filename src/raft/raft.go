@@ -29,7 +29,7 @@ import (
 // import "encoding/gob"
 
 const (
-	HEARTBEAT_TICKER_DURATION     time.Duration = time.Millisecond * 5
+	HEARTBEAT_TICKER_DURATION     time.Duration = time.Millisecond * 50
 	BROADCAST_LOG_TICKER_DURATION time.Duration = time.Millisecond * 10
 )
 
@@ -86,7 +86,7 @@ func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
 
 	term = rf.currentTerm
-	if rf.leader == rf.me {
+	if rf.hasLeader && rf.leader == rf.me {
 		isleader = true
 	} else {
 		isleader = false
@@ -142,6 +142,7 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Me int
 	Agree bool
 }
 
@@ -173,9 +174,10 @@ type AppendEntriesReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	//log.Println("Raft ", rf.me, "term ", rf.currentTerm, " receive vote request from Raft ", args.Me, " term ", args.Term)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	//log.Println("Raft ", rf.me, "term ", rf.currentTerm, " receive vote request from Raft ", args.Me, " term ", args.Term)
+	reply.Me = rf.me
 
 	if args.Term == rf.currentTerm {
 		if args.Me != rf.leader {
@@ -183,7 +185,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		} else {
 			// heartbeat, reset timer
 			reply.Agree = true
-			rf.electionTimer.Reset(rf.electionTimeout)
+			rf.resetElectionTimer()
 			//log.Println("rf ", args.Me, " -> rf ", rf.me)
 		}
 
@@ -206,14 +208,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.leader = args.Me
 			rf.votedTerms[args.Term] = args.Me
 			rf.currentTerm = args.Term
-			rf.electionTimer.Reset(rf.electionTimeout)
-			log.Println("Raft ", rf.me, " vote Raft ", args.Me, " as leader in term ",
+			rf.resetElectionTimer()
+			log.Println("Server ", rf.me, " vote server ", args.Me, " as leader in term ",
 				args.Term)
 		}
 
 	} else {
 		reply.Agree = false
 	}
+	//log.Println("Raft ", rf.me, " reply ", args.Me, " reply: ", reply)
 }
 
 // AppendEntries RPC handler.
@@ -224,18 +227,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Not a legal leader
 	if args.Term < rf.currentTerm || rf.leader != args.Me {
 		reply.Ok = false
+		log.Println("Server ", rf.me, " vote false for ", args.Me, " reason ", 1)
 		return
 	}
 
 	// Current log is shorter
 	if len(rf.log)-1 < args.PrevIndex {
 		reply.Ok = false
+		log.Println("Server ", rf.me, " vote false for ", args.Me, " reason ", 2)
 		return
 	}
 
 	// Previous log item not match
 	if rf.log[args.PrevIndex].Term != args.PrevTerm {
 		reply.Ok = false
+		log.Println("Server ", rf.me, " vote false for ", args.Me, " reason ", 3)
 		return
 	}
 
@@ -252,22 +258,29 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	latestIndex := len(rf.log) - 1
+	var minCommit int
 	if args.CommitIndex < latestIndex {
-		rf.commitIndex = args.CommitIndex
+		minCommit = args.CommitIndex
 	} else {
-		rf.commitIndex = latestIndex
+		minCommit = latestIndex
 	}
-	rf.commitLog()
 
-	log.Println("server ", rf.me, " latestIndex ", latestIndex, " commit index ", args.CommitIndex)
+	if minCommit > rf.commitIndex {
+		rf.commitLog(minCommit)
+	}
+
+	reply.CommitIndex = rf.commitIndex
+	//log.Println("Server ", rf.me, " vote ok for  ", args.Me , " on prev index ", args.PrevIndex)
 }
 
-func (rf *Raft) commitLog() {
-	cmd := rf.log[rf.commitIndex].Command
-	msg := ApplyMsg{Index: rf.commitIndex, Command: cmd}
-	rf.applyCh <- msg
-
-	log.Println("Server ", rf.me, " commit index ", rf.commitIndex)
+func (rf *Raft) commitLog(index int) {
+	for i := rf.commitIndex + 1; i <= index; i++ {
+		cmd := rf.log[i].Command
+		msg := ApplyMsg{Index: i, Command: cmd}
+		rf.applyCh <- msg
+	}
+	log.Println("Server ", rf.me, " commit index (", rf.commitIndex, ", ", index, "]", " LOG: ", rf.log)
+	rf.commitIndex = index
 }
 
 //
@@ -409,17 +422,29 @@ func (rf *Raft) startElectionTimer() {
 	for _ = range rf.electionTimer.C {
 		rf.hasLeader = false
 		rf.triggerElection()
+		rf.resetElectionTimer()
 	}
-
 }
 
 func (rf *Raft) stopElectionTimer() {
-	rf.electionTimer.Stop()
+	if !rf.electionTimer.Stop() {
+		log.Println("Server ", rf.me, " stop election timer failed")
+
+	} else {
+		log.Println("Server ", rf.me, " stop election timer")
+	}
+}
+
+func (rf *Raft) resetElectionTimer() {
+	if !rf.electionTimer.Reset(rf.electionTimeout) {
+		log.Println("Rf ", rf.me, " reset timer failed")
+	}
 }
 
 func (rf *Raft) acquireVote() int {
 	agreeCount := 0
-	ch := make(chan bool)
+
+	ch := make(chan RequestVoteReply)
 	timeout := time.NewTimer(time.Millisecond * 50)
 
 	// send vote request to all raft nodes
@@ -439,11 +464,7 @@ func (rf *Raft) acquireVote() int {
 			//log.Println("Raft ", me, " send vote request to ", server, " term ", term)
 			rf.sendRequestVote(server, &req, &rsp)
 
-			if rsp.Agree {
-				ch <- true
-			} else {
-				ch <- false
-			}
+			ch <- rsp
 		}(rf.me, server, rf.currentTerm)
 	}
 
@@ -452,8 +473,9 @@ func (rf *Raft) acquireVote() int {
 OuterLoop:
 	for ; count > 0; count-- {
 		select {
-		case agree := <-ch:
-			if agree {
+		case reply := <-ch:
+			//log.Println("Candicate ", rf.me, " receive vote ", reply)
+			if reply.Agree {
 				agreeCount++
 			}
 		case <-timeout.C:
@@ -476,12 +498,10 @@ func (rf *Raft) triggerElection() {
 		rf.enthrone()
 
 	} else {
-		log.Println("server ", rf.me, " failed to win the election in term ",
-			rf.currentTerm)
+		//log.Println("server ", rf.me, " failed to win the election in term ",
+			//rf.currentTerm)
 		rf.currentTerm = rf.currentTerm - 1
 	}
-
-	rf.electionTimer.Reset(rf.electionTimeout)
 }
 
 func (rf *Raft) enthrone() {
@@ -490,14 +510,21 @@ func (rf *Raft) enthrone() {
 	rf.hasLeader = true
 	rf.leader = rf.me
 
+	rf.stopElectionTimer()
+
 	go rf.sendHeartbeat()
 	go rf.broadcastLogs()
 }
 
 func (rf *Raft) dethrone() {
 	defer log.Println("Raft ", rf.me, " dethrone")
+	rf.hasLeader = false
+	rf.leader = -1
+
 	rf.stopHeartbeat()
 	rf.stopBroadcastLogs()
+
+	rf.resetElectionTimer()
 }
 
 func (rf *Raft) sendHeartbeat() {
@@ -582,6 +609,7 @@ type ReplicateState struct {
 	Term        int
 	Server      int
 	LatestIndex int
+	Commit	int
 }
 
 // Broadcast logs o all follower at an fixed interval
@@ -607,7 +635,6 @@ func (rf *Raft) broadcastLogs() {
 
 // Replicate log or send new commit to follower
 func (rf *Raft) replicateLog(server, followerNext, leaderLatest, leaderCommit int, successCh chan<- ReplicateState) {
-		//log.Println("replicate to server ", server, " nextIndex ", nextIndex)
 		var args AppendEntriesArgs
 		var reply AppendEntriesReply
 		args.Me = rf.me
@@ -621,6 +648,7 @@ func (rf *Raft) replicateLog(server, followerNext, leaderLatest, leaderCommit in
 			args.Logs = rf.log[followerNext : leaderLatest+1]
 		}
 
+		//log.Println("Raft ", rf.me, " replicate log to server ", server, " ", args)
 		ok := rf.sendAppendEntries(server, &args, &reply)
 		state := ReplicateState{Ok: false, Result: Failed, Server: server}
 
@@ -643,6 +671,8 @@ func (rf *Raft) replicateLog(server, followerNext, leaderLatest, leaderCommit in
 			state.Result = Success
 			state.Term = reply.Term
 			state.LatestIndex = leaderLatest
+			state.Commit = reply.CommitIndex
+			//log.Println("Rf ", rf.me, " replicate to ", server, " success: ", reply)
 		}
 
 		successCh <- state
@@ -666,12 +696,14 @@ func (rf *Raft) broadcastOnTicker(successCh chan<- ReplicateState) {
 				followerCommit := rf.commitIndexs[server]
 
 				if server != rf.me && (leaderLatest >= followerNext || leaderCommit > followerCommit) {
+					//log.Println("ssss ", leaderLatest, " ", followerNext, " ", leaderCommit, " ", followerCommit)
 					go rf.replicateLog(server, followerNext, leaderLatest, leaderCommit, successCh)
 				}
 			}
 
 		case <-rf.stopBroadcastLogCh:
 			log.Println("Raft ", rf.me, " stop broadcast logs")
+			return
 		}
 	}
 }
@@ -686,7 +718,7 @@ func (rf *Raft) addReplicateCount(index , server int) {
 
 func (rf *Raft) updateFollowerStatistic(state *ReplicateState) {
 	if !state.Ok {
-		log.Println("Rf ", rf.me, " replicate log to server ", state.Server, " failed")
+		//log.Println("Rf ", rf.me, " replicate log to server ", state.Server, " failed")
 
 	} else if state.Result == Success {
 		//log.Println("Rf ", rf.me, " replicate log to server ", state.Server, " success, next index ",
@@ -694,23 +726,34 @@ func (rf *Raft) updateFollowerStatistic(state *ReplicateState) {
 
 		rf.nextIndex[state.Server] = state.LatestIndex + 1
 		rf.matchIndex[state.LatestIndex] = state.LatestIndex
+		rf.commitIndexs[state.Server] = state.Commit
 		rf.addReplicateCount(state.LatestIndex, state.Server)
 
 		// Leader commit log
-		if state.LatestIndex > rf.commitIndex && len(rf.logSuccessCount[state.LatestIndex]) > len(rf.peers)/2 {
+		if state.LatestIndex > rf.commitIndex && len(rf.logSuccessCount[state.LatestIndex]) >= len(rf.peers)/2 {
 			//log.Println(rf.logSuccessCount[state.LatestIndex], " server have received log index ", state.LatestIndex, " commitIndex ", rf.commitIndex)
 
-			rf.commitIndex = state.LatestIndex
-			rf.commitLog()
+			rf.commitLog(state.LatestIndex)
 		}
 
 	} else if state.Result == LogInconsistent {
-		rf.nextIndex[state.Server] = rf.repositionNextIndex(state.Server)
-		log.Println("Rf ", rf.me, " has inconsistent log with ", state.Server, " adjust next index to",
-			rf.nextIndex[state.Server])
+		prevIndex := rf.nextIndex[state.Server] - 1
+
+		log.Println("Rf ", rf.me, " has inconsistent log with ", state.Server, " at prev index ", prevIndex)
+		nextIndex, ok := rf.repositionNextIndex(state.Server, prevIndex)
+		if ok {
+			rf.nextIndex[state.Server] = nextIndex
+			log.Println("Rf ", rf.me, " has inconsistent log with ", state.Server, " adjust next index to",
+				rf.nextIndex[state.Server])
+
+		} else {
+			log.Println("Rf ", rf.me, " reposition index for ", state.Server, " failed")
+		}
+
 
 	} else if state.Result == OldTerm {
 		log.Println("Follower ", state.Server, " has newer term ", state.Term)
+		rf.dethrone()
 	}
 }
 
@@ -722,7 +765,7 @@ func (rf *Raft) receiveBroadcastResult(ch <-chan ReplicateState) {
 
 		case <-rf.stopBroadcastLogCh:
 			log.Println("Rf ", rf.me, " stop receiving broadcast result")
-			break
+			return
 		}
 	}
 }
@@ -735,9 +778,7 @@ func (rf *Raft) stopBroadcastLogs() {
 }
 
 // Find the latest log which leader and follower agree
-func (rf *Raft) repositionNextIndex(server int) int {
-	prevIndex := rf.nextIndex[server] - 1
-
+func (rf *Raft) repositionNextIndex(server int, prevIndex int) (int, bool) {
 	for {
 		var args AppendEntriesArgs
 		var reply AppendEntriesReply
@@ -747,17 +788,23 @@ func (rf *Raft) repositionNextIndex(server int) int {
 		args.PrevIndex = prevIndex
 		args.PrevTerm = rf.log[args.PrevIndex].Term
 		ok := rf.sendAppendEntries(server, &args, &reply)
-		if !ok && reply.Term > rf.currentTerm {
+		if !ok {
+			//log.Println("Rf ", rf.me, " repositon ", server, " log index failed")
+		} else if !reply.Ok && reply.Term > rf.currentTerm {
 			// Follower has high term, do nothing and just wait new leader's heartbeat
-			return -1
+			log.Println("Follower ", server, " has higher term ", reply.Term, " than Rf ", rf.me, " term ", rf.currentTerm)
+			return -1, false
 
-		} else if !ok && reply.Term <= rf.currentTerm {
+		} else if !reply.Ok && reply.Term <= rf.currentTerm {
 			// Normal follower, decrement index to find the match index
 			prevIndex--
+			log.Println("Follower ", server, " term ", reply.Term, " has inconsist log with Rf ", rf.me, " term ",
+				rf.currentTerm, " at prevIndex ", prevIndex + 1, " adjuct to ", prevIndex)
 
 		} else {
 			// Leader and follower agree on log index prevIndex, adjust nextIndex
-			return prevIndex + 1
+			log.Println("Follower ", server, " agree on prevIndex ", prevIndex)
+			return prevIndex + 1, true
 		}
 	}
 }

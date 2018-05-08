@@ -116,6 +116,7 @@ func TestFailAgree2B(t *testing.T) {
 
 	// follower network disconnection
 	leader := cfg.checkOneLeader()
+	fmt.Println("dissconnect ", (leader + 1) % servers)
 	cfg.disconnect((leader + 1) % servers)
 
 	// agree despite one disconnected server?
@@ -126,6 +127,7 @@ func TestFailAgree2B(t *testing.T) {
 	cfg.one(105, servers-1)
 
 	// re-connect
+	fmt.Println("reconnect ", (leader + 1) % servers)
 	cfg.connect((leader + 1) % servers)
 
 	// agree with full set of servers?
@@ -301,6 +303,7 @@ func TestRejoin2B(t *testing.T) {
 	// leader network failure
 	leader1 := cfg.checkOneLeader()
 	cfg.disconnect(leader1)
+	fmt.Println("disconnect ", leader1)
 
 	// make old leader try to agree on some entries
 	cfg.rafts[leader1].Start(102)
@@ -313,14 +316,17 @@ func TestRejoin2B(t *testing.T) {
 	// new leader network failure
 	leader2 := cfg.checkOneLeader()
 	cfg.disconnect(leader2)
+	fmt.Println("disconnect ", leader2)
 
 	// old leader connected again
 	cfg.connect(leader1)
+	fmt.Println("connect ", leader1)
 
 	cfg.one(104, 2)
 
 	// all together now
 	cfg.connect(leader2)
+	fmt.Println("connect ", leader2)
 
 	cfg.one(105, servers)
 
